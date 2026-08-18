@@ -153,7 +153,14 @@ def escapeHtml (s : String) :=
 def exitWithError {α} (errMsg : String) (instructorInfo: String := "")
   : IO α := do
   let result : FailureResult := {output := errMsg}
-  IO.FS.writeFile resultsJsonPath (toJson result).pretty
+  -- Outside a real Gradescope container (e.g. local dev testing outside `--local`'s
+  -- own results-printing path, or an error raised before we even know we're in
+  -- `--local` mode, like a bad CLI argument), `../results` won't exist. Don't let
+  -- that write failure mask the actual error below with a confusing, unrelated
+  -- "no such file or directory" instead.
+  try
+    IO.FS.writeFile resultsJsonPath (toJson result).pretty
+  catch _ => pure ()
   throw <| IO.userError (errMsg ++ "\n" ++ instructorInfo)
 
 /-- Axioms declared in the sheet and tagged `@[legalAxiom]`, in addition to whatever
