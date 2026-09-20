@@ -112,3 +112,32 @@ initialize autograderTestAttr : ParametricAttribute (Name × String) ←
 initialize legalAxiomAttr : TagAttribute ←
   registerTagAttribute `legalAxiom
     "Marks an axiom as acceptable for use in autograded solutions"
+
+/-! ## Restricting which tactics a student may use
+
+`@[autogradedProof]` only ever checks that a submitted proof *closes the stated
+theorem* using permitted axioms; it says nothing about how the student got there.
+That leaves a gap whenever an assignment asks students to practice a particular
+technique: a one-word `grind` or `simp` closes many such exercises outright and
+would otherwise be awarded full credit.
+
+`@[allowedTactics #["rewrite", "rfl"]]` closes that gap by naming the *only*
+tactics permitted in a given proof. It is an allowlist, not a blocklist, so a
+tactic nobody thought to forbid is rejected by default rather than accepted.
+
+Tactics are named by the keyword a student actually types (`"rewrite"`, `"rfl"`,
+`"intro"`). String literals are used rather than identifiers so that tactics whose
+names are not valid Lean identifiers -- `"exact?"`, `"<;>"` -- can be named too. -/
+syntax:50 (name := allowed_tactics) "allowedTactics" "#[" sepBy(str, ",") "]" : attr
+
+initialize allowedTacticsAttr : ParametricAttribute (Array String) ←
+  registerParametricAttribute {
+    name := `allowed_tactics
+    descr := "Specifies the only tactics permitted in a student's proof"
+    getParam := λ _ stx =>
+      match stx with
+        | `(attr| allowedTactics #[$tacs,*]) =>
+          return tacs.getElems.map (fun s => s.getString)
+        | _ => throwError "Invalid allowedTactics attribute"
+    afterSet := λ _ _ => do pure ()
+  }

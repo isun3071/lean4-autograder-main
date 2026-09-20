@@ -522,6 +522,136 @@ def defQuickCheck (subName name : Name) (subConstInfo : ConstantInfo) :
            output_log := "Declaration does not contain a value" }
   else none
 
+/-! ## Tactic allowlist enforcement
+
+`@[autogradedProof]` checks only that a submission *closes the stated theorem* using
+permitted axioms. It deliberately says nothing about how the proof was found, which is
+usually right -- but not when an assignment exists to practice a specific technique.
+Many propositional exercises fall to a one-word `grind` or `simp`, and those would
+otherwise earn full marks while demonstrating none of the intended skill.
+
+`@[allowedTactics]` on a sheet exercise restricts which tactics its proof may use. Two
+properties matter for it to be enforcement rather than an honour-system nudge:
+
+* **The check runs on a parse of the submission, not on its elaboration.** Elaborating a
+  Lean file executes arbitrary code in this process (`initialize`/`#eval`/`run_cmd`
+  blocks run during elaboration, which is exactly why `run_autograder` destroys the
+  deploy key beforehand). Parsing executes none of it, so a submission cannot influence
+  the verdict on itself.
+* **Parsing uses the *sheet's* environment, never the submission's.** Which syntax is a
+  tactic at all is therefore fixed by the instructor's imports. A submission cannot
+  enlarge that set by declaring its own `syntax ... : tactic`, nor reach a tactic from a
+  library the sheet does not import -- such a file simply fails to parse here, which is
+  reported as a violation rather than quietly allowed.
+
+It remains a *syntactic* check, and the honest limit is that it constrains tactics, not
+proofs: a submission that writes the proof term directly, using no tactics at all, has
+nothing for this to reject. Catching that needs a check on the elaborated term, which
+is a different (and much harder to calibrate) mechanism -- see the README. -/
+
+/-- Syntax node kinds registered in Lean's `tactic` parser category, according to `env`.
+
+Testing membership here, rather than pattern-matching a hard-coded list of tactic names
+or sniffing the kind's name for `.Tactic.`, is what makes the walk below complete: every
+tactic is registered in this category, including ones defined by `macro`/`syntax`
+declarations, so none is invisible to the allowlist. -/
+def tacticKinds (env : Environment) : PersistentHashMap SyntaxNodeKind Unit :=
+  match (Parser.parserExtension.getState env).categories.find? `tactic with
+  | some cat => cat.kinds
+  | none     => .empty
+
+/-- The name a student would recognize a tactic node by: the keyword they typed.
+
+Every tactic node's first child is an atom holding that keyword (`rewrite`, `rfl`,
+`intro`), so this reports exactly what appears in the source. The fallback covers
+infix combinators such as `<;>`, whose first child is a nested tactic rather than an
+atom; those are named by the last component of their syntax kind. -/
+def tacticDisplayName (stx : Syntax) : String :=
+  match stx with
+  | .node _ k args =>
+    match args[0]? with
+    | some (Lean.Syntax.atom _ v) => v
+    | _ => (k.components.getLastD `unknown).toString
+  | _ => "<malformed>"
+
+/-- Every tactic node anywhere inside `stx`, outermost first.
+
+Recursion continues *through* tactic nodes rather than stopping at them, so tactics
+nested inside a combinator (`first | rfl | simp`, `try simp`, `rfl <;> simp`) are each
+checked on their own. Both the combinator and its branches must be permitted. -/
+partial def collectTactics (kinds : PersistentHashMap SyntaxNodeKind Unit)
+    (stx : Syntax) (acc : Array Syntax := #[]) : Array Syntax :=
+  let acc := if kinds.contains stx.getKind then acc.push stx else acc
+  stx.getArgs.foldl (fun a c => collectTactics kinds c a) acc
+
+/-- The name a parsed command declares, if it declares one. -/
+partial def declNameOf? (stx : Syntax) : Option Name :=
+  if stx.getKind == ``Lean.Parser.Command.declId then
+    some stx[0].getId
+  else
+    stx.getArgs.findSome? declNameOf?
+
+/-- Splits `contents` into top-level commands, parsing only -- nothing is elaborated, so
+none of the submission's own code runs. `env` supplies the syntax in scope and is always
+the sheet's environment; see the note above. -/
+def parseCommandsOnly (env : Environment) (contents fileName : String)
+    : IO (Array Syntax) := do
+  let ictx := Parser.mkInputContext contents fileName
+  let (_, parserState, _) ← Parser.parseHeader ictx
+  let pmctx : Parser.ParserModuleContext := { env, options := {} }
+  let mut cmds : Array Syntax := #[]
+  let mut ps := parserState
+  let mut msgs := MessageLog.empty
+  while !ictx.atEnd ps.pos do
+    let (stx, ps', msgs') := Parser.parseCommand ictx pmctx ps msgs
+    -- A command that consumes nothing means the parser is stuck (an unparseable
+    -- construct); stop rather than spin forever on it.
+    if ps'.pos == ps.pos then break
+    cmds := cmds.push stx
+    ps := ps'
+    msgs := msgs'
+  return cmds
+
+/-- Whether any part of `stx` failed to parse.
+
+`parseCommandsOnly` uses the *sheet's* syntax, so a submission that declares its own
+tactic (`macro "sneaky" : tactic => `(tactic| grind)`) leaves a hole here: the tactic is
+real when the submission elaborates itself, but is not syntax we know, so it parses as
+`missing`. That must be refused rather than silently contributing no tactic names to
+check -- otherwise defining a macro would be a way to become invisible to the allowlist. -/
+partial def containsMissing (stx : Syntax) : Bool :=
+  match stx with
+  | .missing      => true
+  | .node _ _ args => args.any containsMissing
+  | _             => false
+
+/-- Whether `stx` contains a `by` block, i.e. is proved with tactics at all.
+
+An exercise carrying `@[allowedTactics]` is asking the student to practice tactics, so a
+term-mode proof (`:= fun h => h.1 h.2`) sidesteps the exercise entirely *and* offers the
+allowlist nothing to inspect. Requiring a tactic block closes that, leaving the allowlist
+itself to govern which tactics are then used. -/
+partial def containsByBlock (stx : Syntax) : Bool :=
+  stx.getKind == ``Lean.Parser.Term.byTactic
+    || stx.getArgs.any containsByBlock
+
+/-- Tactics used in `cmdStx` that `allowed` does not permit, deduplicated and in source
+order. An empty array means the proof is within its budget. -/
+def disallowedTactics (kinds : PersistentHashMap SyntaxNodeKind Unit)
+    (allowed : Array String) (cmdStx : Syntax) : Array String :=
+  (collectTactics kinds cmdStx).foldl (init := #[]) fun bad s =>
+    let n := tacticDisplayName s
+    if allowed.contains n || bad.contains n then bad else bad.push n
+
+/-- Student-facing explanation of a tactic violation. It names both what was used and
+what was permitted, so the student can correct the proof rather than guess. -/
+def tacticViolationMessage (bad allowed : Array String) : String :=
+  let list (a : Array String) := String.intercalate ", " (a.toList.map (s!"`{·}`"))
+  s!"This exercise restricts which tactics you may use. Your proof uses "
+    ++ s!"{list bad}, which " ++ (if bad.size == 1 then "is" else "are")
+    ++ " not permitted here. Permitted tactics for this exercise: "
+    ++ s!"{list allowed}."
+
 def gradeSubmission (sheet submission : Environment)
     (sheetContents submissionContents : String) : IO (Array ExerciseResult) := do
   writeComparatorRef sheetContents
@@ -532,11 +662,55 @@ def gradeSubmission (sheet submission : Environment)
   let mut immediateResults : Array ExerciseResult := #[]
   let mut nextIdx := 0
 
+  -- Parse the submission once, up front, for `@[allowedTactics]` checking. This is a
+  -- parse only: none of the submission's code runs, and the syntax in scope comes from
+  -- the sheet, not the submission. Indexed by declared name so each exercise can be
+  -- checked against the declaration that actually claims to answer it.
+  let kinds := tacticKinds sheet
+  let submissionCmds ← parseCommandsOnly sheet submissionContents submissionFileName
+  let mut declCmds : Std.HashMap Name Syntax := ∅
+  for cmd in submissionCmds do
+    if let some n := declNameOf? cmd then
+      declCmds := declCmds.insert n cmd
+
   for (name, constInfo) in sheet.constants.toList do
     if let some pts := autogradedProofAttr.getParam? sheet name then
       if not name.isInternal then
         if (submission.find? name).isSome then
-          proofExercises := proofExercises.push (name, pts)
+          -- A tactic violation fails the exercise outright, before Comparator is
+          -- consulted: the proof may well be valid, but it is not the proof this
+          -- exercise asked for, so there is nothing for verification to settle.
+          match allowedTacticsAttr.getParam? sheet name with
+          | some allowed =>
+            -- Every branch here fails closed: anything this check cannot fully see
+            -- through is refused, never waved on.
+            let verdict : Option String :=
+              match declCmds[name]? with
+              | none =>
+                -- Elaboration found the declaration but our parse did not, so we have
+                -- nothing to inspect.
+                some ("Your proof of this exercise could not be checked against its "
+                  ++ "permitted-tactic list, so it cannot be awarded credit. Submit the "
+                  ++ "proof directly, as an ordinary theorem, rather than generating it.")
+              | some cmd =>
+                if containsMissing cmd then
+                  some ("Your proof of this exercise uses syntax that is not available "
+                    ++ "for this assignment, so it could not be checked against the "
+                    ++ "permitted-tactic list. Do not define your own tactics or import "
+                    ++ "libraries beyond the ones the assignment provides.")
+                else if !containsByBlock cmd then
+                  some ("This exercise must be solved with a tactic proof (`:= by ...`), "
+                    ++ "using only its permitted tactics. Writing the proof term "
+                    ++ "directly is not accepted here.")
+                else
+                  let bad := disallowedTactics kinds allowed cmd
+                  if bad.isEmpty then none else some (tacticViolationMessage bad allowed)
+            match verdict with
+            | none => proofExercises := proofExercises.push (name, pts)
+            | some output =>
+              immediateResults := immediateResults.push
+                { name, score := 0.0, status := "failed", output }
+          | none => proofExercises := proofExercises.push (name, pts)
         else
           immediateResults := immediateResults.push
             { name, score := 0.0, status := "failed",
